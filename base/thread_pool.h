@@ -13,7 +13,7 @@
 namespace comm {
 using namespace std;
 
-template <int Flag>
+template <typename Flag>
 class ThreadPool
 {
 public:
@@ -34,13 +34,15 @@ private:
 	int m_max_queue_size;
 };
 
-typedef ThreadPool<1> MainThreadPool;
+enum MainPool {};
+
+typedef ThreadPool<MainPool> MainThreadPool;
 
 }
 
 namespace comm{
 
-template <int Flag>
+template <typename Flag>
 ThreadPool<Flag>::ThreadPool():
 	m_threadPool(0),
 	m_bRunning(false),
@@ -52,7 +54,7 @@ ThreadPool<Flag>::ThreadPool():
 	m_bRunning = false;
 }
 
-template <int Flag>
+template <typename Flag>
 ThreadPool<Flag>::~ThreadPool()
 {
 	m_bRunning = false;
@@ -64,7 +66,7 @@ ThreadPool<Flag>::~ThreadPool()
 	}
 }
 
-template <int Flag>
+template <typename Flag>
 void ThreadPool<Flag>::Run(int maxThread, int max_queue_size)
 {
 	assert( maxThread>0);
@@ -80,7 +82,7 @@ void ThreadPool<Flag>::Run(int maxThread, int max_queue_size)
 
 }
 
-template <int Flag>
+template <typename Flag>
 void ThreadPool<Flag>::Submit(Closure<void>* job)
 {
 	assert(NULL != job);
@@ -92,7 +94,7 @@ void ThreadPool<Flag>::Submit(Closure<void>* job)
 	m_cond_consumer.Notify();
 }
 
-template <int Flag>
+template <typename Flag>
 void* ThreadPool<Flag>:: RunInThread(void* p)
 {
 

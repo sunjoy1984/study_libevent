@@ -23,13 +23,16 @@ const int MAX_IO_THREAD_COUNT = 5;
 const int MAX_JOB_THREAD_COUNT = 10;
 const int MAX_JOB_PENDING_COUNT = 100000;
 
-std::vector<struct event_base *> g_ebase;
-ptr::scoped_ptr<MainThreadPool > g_io_pool;
-ptr::scoped_ptr<ThreadPool<2> > g_job_pool;
+struct IOWorker;
+struct JobWorker;
 
-struct IOWorkder {
+std::vector<struct event_base *> g_ebase;
+ptr::scoped_ptr<ThreadPool<IOWorker> > g_io_pool;
+ptr::scoped_ptr<ThreadPool<JobWorker> > g_job_pool;
+
+struct IOWorker {
 	struct event_base * base;
-	IOWorkder() : base(NULL) {}
+	IOWorker() : base(NULL) {}
 	void Loop() {
 		if (base) {
 			event_base_dispatch(base);
@@ -39,13 +42,13 @@ struct IOWorkder {
 	}
 };
 
-struct JobData {
+struct JobWorker {
 	bufferevent * job_out_bev;
 	bufferevent * job_in_bev;
 	bufferevent * remote_bev;
 	uint64_t ref_count;
 	Mutex mutex;
-	JobData() : job_out_bev(NULL), job_in_bev(NULL), remote_bev(NULL), ref_count(0) {}
+	JobWorker() : job_out_bev(NULL), job_in_bev(NULL), remote_bev(NULL), ref_count(0) {}
 
 	void AddJobOutput(const char* buf, size_t buf_len) {
 		SafeMutex _(mutex);
@@ -69,9 +72,15 @@ struct JobData {
 	}
 
 	void DecRef() {
-		SafeMutex _(mutex);
-		ref_count--;
-		if (ref_count<=0) {
+        bool should_delete = false;
+        {
+            SafeMutex _(mutex);
+            ref_count--;
+            if (ref_count<=0) {
+                should_delete = true;
+            }
+        }
+        if (should_delete) {
 			bufferevent_free(job_in_bev);
 			bufferevent_free(job_out_bev);
 			fprintf(stderr, "delete job data %x\n", this);
@@ -114,20 +123,21 @@ int main(int argc, char *argv[])
 
     struct evconnlistener *listener;
 
-    g_io_pool.reset(new comm::MainThreadPool());
+    g_io_pool.reset(new ThreadPool<IOWorker>());
+    g_job_pool.reset(new ThreadPool<JobWorker>() );
+
     g_io_pool->Run(MAX_IO_THREAD_COUNT, MAX_IO_THREAD_COUNT);
-    g_job_pool.reset(new comm::ThreadPool<2>() );
     g_job_pool->Run(MAX_JOB_THREAD_COUNT, MAX_JOB_PENDING_COUNT);
 
     for (int i=0; i < MAX_IO_THREAD_COUNT; i++) {
 		struct event_base *base = event_base_new();
-		IOWorkder * worker = new IOWorkder();
+		IOWorker * worker = new IOWorker();
 		worker->base = base;
 		struct bufferevent *bev = bufferevent_socket_new(base, -1, BEV_OPT_CLOSE_ON_FREE);
 		bufferevent_setcb(bev, OnMessage, NULL, OnError, worker);
 		bufferevent_enable(bev, EV_READ|EV_WRITE|EV_PERSIST); //dummy event, never triggered;
 		g_ebase.push_back(base);
-		g_io_pool->Submit(NewClosure(worker,&IOWorkder::Loop));
+		g_io_pool->Submit(NewClosure(worker,&IOWorker::Loop));
     }
 
     printf ("Listening...\n");
@@ -164,37 +174,37 @@ void OnConnection(struct evconnlistener *listener, evutil_socket_t fd,
 	struct bufferevent * rsps_bev[2];
 	int ret = bufferevent_pair_new(base, BEV_OPT_CLOSE_ON_FREE, rsps_bev);
 	assert(ret>=0);
-	JobData* job_data = new JobData();
-	job_data->job_in_bev = rsps_bev[0];
-	job_data->job_out_bev = rsps_bev[1];
-	job_data->remote_bev = bev;
-	job_data->IncRef();
+	JobWorker* job_worker = new JobWorker();
+	job_worker->job_in_bev = rsps_bev[0];
+	job_worker->job_out_bev = rsps_bev[1];
+	job_worker->remote_bev = bev;
+	job_worker->IncRef();
 
-	bufferevent_setcb(bev, OnMessage, NULL, OnError, job_data);
+	bufferevent_setcb(bev, OnMessage, NULL, OnError, job_worker);
 	bufferevent_enable(bev, EV_READ | EV_WRITE | EV_PERSIST);
 
-	bufferevent_setcb(job_data->job_out_bev, OnJobComplete, NULL, OnJobError, job_data);
-	bufferevent_enable(job_data->job_out_bev, EV_READ | EV_PERSIST);
+	bufferevent_setcb(job_worker->job_out_bev, OnJobComplete, NULL, OnJobError, job_worker);
+	bufferevent_enable(job_worker->job_out_bev, EV_READ | EV_PERSIST);
 }
 
 void OnJobComplete(struct bufferevent * job_out_bev, void* arg) {
-	JobData * job_data = (JobData*)arg;
-	assert(job_data);
+	JobWorker * job_worker = (JobWorker*)arg;
+	assert(job_worker);
 	char buf[256];
 	int n_bytes;
 	while (true) {
-		n_bytes = job_data->ReadJobOutput(buf, sizeof(buf));
+		n_bytes = job_worker->ReadJobOutput(buf, sizeof(buf));
 		if (n_bytes<=0) {
 			break;
 		}
-		job_data->SendToRemote(buf, n_bytes);
-		job_data->DecRef();
+		job_worker->SendToRemote(buf, n_bytes);
+		job_worker->DecRef();
 	}
 }
 
 void OnJobError(struct bufferevent *bev, short event, void *arg) {
-	JobData * job_data = (JobData*)arg;
-	job_data->DecRef();
+	JobWorker * job_worker = (JobWorker*)arg;
+	job_worker->DecRef();
 }
 
 void HandleMessage(char* request, size_t size, void* args) {
@@ -202,20 +212,23 @@ void HandleMessage(char* request, size_t size, void* args) {
 	std::string resps(request, size);
 	resps = "ACK:" + resps + "\n";
 	free(request);
-	JobData* job_data = (JobData*)args;
-	job_data->AddJobOutput(resps.data(), resps.size());
+	JobWorker* job_worker = (JobWorker*)args;
+    //int x = random() % 5;
+    //printf(" sleep: %d\n", x);
+    //sleep(x);
+	job_worker->AddJobOutput(resps.data(), resps.size());
 }
 
 void OnMessage(struct bufferevent *bev, void *args)
 {
 	assert(args);
-	JobData* job_data = (JobData*)args;
+	JobWorker* job_worker = (JobWorker*)args;
     evbuffer* input = bufferevent_get_input(bev);
     size_t nbytes = 0;
     char* line = NULL;
     while (line = evbuffer_readln(input, &nbytes, EVBUFFER_EOL_ANY), line) {
 		printf("recv: %s\n", line);
-		job_data->IncRef();
+		job_worker->IncRef();
 		g_job_pool->Submit(NewClosure(&HandleMessage, line, nbytes, args));
     }
 
@@ -224,10 +237,10 @@ void OnMessage(struct bufferevent *bev, void *args)
 void OnError(struct bufferevent *bev, short what, void *args)
 {
 	assert(args);
-	JobData* job_data = (JobData*)args;
+	JobWorker* job_worker = (JobWorker*)args;
 	fprintf(stderr, "err %d\n", what);
-	job_data->CloseRemote();
-	job_data->DecRef();
+	job_worker->CloseRemote();
+	job_worker->DecRef();
 }
 
 void OnSignal(evutil_socket_t sig, short events, void *user_data)
