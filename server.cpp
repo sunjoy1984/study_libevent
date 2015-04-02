@@ -27,8 +27,8 @@ struct IOWorker;
 struct JobWorker;
 
 std::vector<struct event_base *> g_ebase;
-ptr::scoped_ptr<ThreadPool<IOWorker> > g_io_pool;
-ptr::scoped_ptr<ThreadPool<JobWorker> > g_job_pool;
+ptr::scoped_ptr<ThreadPool> g_io_pool;
+ptr::scoped_ptr<ThreadPool> g_job_pool;
 
 struct IOWorker {
 	struct event_base * base;
@@ -51,30 +51,30 @@ struct JobWorker {
 	JobWorker() : job_out_bev(NULL), job_in_bev(NULL), remote_bev(NULL), ref_count(0) {}
 
 	void AddJobOutput(const char* buf, size_t buf_len) {
-		SafeMutex _(mutex);
+		MutexLock _(mutex);
 		bufferevent_write(job_in_bev, buf, buf_len);
 	}
 
 	int ReadJobOutput(char* buf, size_t buf_len) {
-		SafeMutex _(mutex);
+		MutexLock _(mutex);
 		return bufferevent_read(job_out_bev, buf, buf_len);
 	}
 
 	void CloseRemote() {
-		SafeMutex _(mutex);
+		MutexLock _(mutex);
 		bufferevent_free(remote_bev);
 		remote_bev = NULL;
 	}
 
 	void IncRef() {
-		SafeMutex _(mutex);
+		MutexLock _(mutex);
 		ref_count++;
 	}
 
 	void DecRef() {
         bool should_delete = false;
         {
-            SafeMutex _(mutex);
+            MutexLock _(mutex);
             ref_count--;
             if (ref_count<=0) {
                 should_delete = true;
@@ -89,7 +89,7 @@ struct JobWorker {
 	}
 
 	void SendToRemote(const char* buf, size_t n_bytes) {
-		SafeMutex _(mutex);
+		MutexLock _(mutex);
 		if (remote_bev) {
 			bufferevent_write(remote_bev, buf, n_bytes);
 		}
@@ -123,11 +123,8 @@ int main(int argc, char *argv[])
 
     struct evconnlistener *listener;
 
-    g_io_pool.reset(new ThreadPool<IOWorker>());
-    g_job_pool.reset(new ThreadPool<JobWorker>() );
-
-    g_io_pool->Run(MAX_IO_THREAD_COUNT, MAX_IO_THREAD_COUNT);
-    g_job_pool->Run(MAX_JOB_THREAD_COUNT, MAX_JOB_PENDING_COUNT);
+    g_io_pool.reset(new ThreadPool());
+    g_job_pool.reset(new ThreadPool() );
 
     for (int i=0; i < MAX_IO_THREAD_COUNT; i++) {
 		struct event_base *base = event_base_new();
@@ -137,7 +134,7 @@ int main(int argc, char *argv[])
 		bufferevent_setcb(bev, OnMessage, NULL, OnError, worker);
 		bufferevent_enable(bev, EV_READ|EV_WRITE|EV_PERSIST); //dummy event, never triggered;
 		g_ebase.push_back(base);
-		g_io_pool->Submit(NewClosure(worker,&IOWorker::Loop));
+		g_io_pool->AddTask(NewClosure(worker,&IOWorker::Loop));
     }
 
     printf ("Listening...\n");
@@ -229,7 +226,7 @@ void OnMessage(struct bufferevent *bev, void *args)
     while (line = evbuffer_readln(input, &nbytes, EVBUFFER_EOL_ANY), line) {
 		printf("recv: %s\n", line);
 		job_worker->IncRef();
-		g_job_pool->Submit(NewClosure(&HandleMessage, line, nbytes, args));
+		g_job_pool->AddTask(NewClosure(&HandleMessage, line, nbytes, args));
     }
 
 }
